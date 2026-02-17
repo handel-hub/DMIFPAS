@@ -16,5 +16,9 @@
   "bugs": {
     "url": "https://github.com/handel-hub/DMIFPAS/issues"
   },
-  "homepage": "https://github.com/handel-hub/DMIFPAS#readme"
+  "homepage": "https://github.com/handel-hub/DMIFPAS#readme",
+  "dependencies": {
+    "dotenv": "^17.3.0",
+    "pg": "^8.18.0"
+  }
 }
