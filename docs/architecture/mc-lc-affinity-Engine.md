@@ -101,3 +101,438 @@ The DFPS 2.0 Affinity Matcher is an advisory engine that completely solves dimen
 
 Because every mathematical update and retrieval executes in  time using simple arithmetic, the Node.js event loop can process thousands of complex contextual matches per second without ever dropping a tick.
 
+
+---------------------------------------------------------------------------------------------------------------
+
+
+## Production Engineering Specification (Expanded)
+
+---
+
+# 1️⃣ Purpose of the Affinity Module
+
+The Affinity Module produces a **behavioral suitability score** for:
+
+```
+(Local Coordinator, Workload Bucket, Processing Pipeline)
+```
+
+This score represents:
+
+> “How safe and efficient is this LC for this type of workload?”
+
+Affinity is:
+
+* Behavioral (based only on observed execution behavior)
+* Statistical (based on accumulated evidence)
+* Continuous (no binary healthy/unhealthy flag)
+* Conservative by design
+* Infrastructure-agnostic
+
+Affinity does NOT:
+
+* Diagnose hardware failures
+* Detect disk locality issues
+* Model network topology
+* Perform admission control
+* Enforce hard scheduling gates
+
+It is a scoring component — not a control mechanism.
+
+---
+
+# 2️⃣ Granularity of Affinity
+
+Affinity is computed at:
+
+```
+LC × Bucket × Pipeline
+```
+
+### Why this level?
+
+* The pipeline executes atomically inside a processing unit.
+* All transformations happen within the same LC.
+* Modeling stage-level affinity would increase dimensionality and complexity.
+
+### Why not stage-level?
+
+Stage-level affinity becomes necessary only if:
+
+* Different stages use different hardware paths (e.g., CPU vs GPU).
+* Stages are scheduled independently.
+* Repeated isolated-stage instability is observed.
+
+For now, pipeline-level affinity is sufficient and aligned with execution granularity.
+
+---
+
+# 3️⃣ High-Level Composition
+
+Affinity is composed of three components:
+
+```
+Affinity =
+    Structural Confidence
+    × Reliability
+    × Performance
+```
+
+Each component answers a different question:
+
+| Component             | Question it answers                |
+| --------------------- | ---------------------------------- |
+| Structural Confidence | Do we have enough recent evidence? |
+| Reliability           | Does this LC succeed consistently? |
+| Performance           | How fast and stable is it?         |
+
+This separation prevents metric entanglement.
+
+---
+
+# 4️⃣ Performance Component
+
+## 4.1 What It Measures
+
+Performance measures execution speed and stability.
+
+It penalizes:
+
+* High execution time
+* High variance (unstable performance)
+
+---
+
+## 4.2 Data Tracked
+
+For each (LC, Bucket, Pipeline), we maintain:
+
+* μ (EMA mean execution time per MB)
+* σ (EMA deviation)
+
+These are updated using Exponential Moving Average (EMA).
+
+---
+
+## 4.3 Why EMA?
+
+EMA:
+
+* Automatically gives more weight to recent data.
+* Gradually forgets older behavior.
+* Requires no explicit time decay logic.
+
+This provides implicit temporal adaptation.
+
+---
+
+## 4.4 Performance Formula
+
+```
+Perf = 1 / (μ + λσ)
+```
+
+Where:
+
+* μ = average execution time
+* σ = instability measure
+* λ = variance penalty weight (policy-configurable)
+
+Higher σ increases penalty.
+
+This discourages unstable nodes.
+
+---
+
+# 5️⃣ Structural Confidence
+
+## 5.1 What It Represents
+
+Structural confidence answers:
+
+> “How certain are we about our estimates?”
+
+If only 2 jobs were processed:
+
+* Even perfect results should not be fully trusted.
+
+If 500 jobs were processed:
+
+* Confidence is much higher.
+
+---
+
+## 5.2 Formula
+
+```
+C_struct = N / (N + N_min)
+```
+
+Where:
+
+* N = total effective samples
+* N_min = minimum evidence threshold (policy-defined)
+
+This ensures:
+
+* Smooth confidence growth
+* No hard thresholds
+* Early overconfidence is prevented
+
+---
+
+## 5.3 Explicit Temporal Decay
+
+Structural confidence decays over time:
+
+```
+C_time = exp(-Δt / τ_struct)
+Confidence = C_struct × C_time
+```
+
+Where:
+
+* Δt = time since last update
+* τ_struct = decay constant
+
+If a node becomes inactive:
+
+* Its confidence gradually decreases.
+* Its influence weakens.
+* But it is not instantly forgotten.
+
+---
+
+# 6️⃣ Reliability Component
+
+## 6.1 What It Measures
+
+Reliability measures success vs failure rate.
+
+It answers:
+
+> “Does this LC complete jobs successfully?”
+
+---
+
+## 6.2 Bayesian Smoothing
+
+To avoid instability for small samples:
+
+```
+Reliability = (S + α) / (N + α + β)
+```
+
+Where:
+
+* S = success count
+* N = total attempts
+* α, β = prior parameters
+
+This prevents:
+
+* Overconfidence from 1 success
+* Over-punishment from 1 failure
+
+---
+
+## 6.3 Redemption Policy
+
+Redemption is intentionally slow.
+
+If a node:
+
+* Failed heavily yesterday
+* Succeeds slightly today
+
+It should not instantly regain trust.
+
+This reflects a conservative system philosophy.
+
+---
+
+## 6.4 Reliability Decay Policy
+
+By default:
+
+* Reliability does NOT decay explicitly.
+* It only changes via new evidence.
+
+Optional policy (future):
+
+* Introduce slow reliability decay.
+* Slower than structural confidence decay.
+
+This ensures:
+
+Confidence decays faster than trust.
+
+---
+
+# 7️⃣ Complexity Assumptions
+
+## 7.1 Current Model
+
+The system assumes:
+
+* Near-linear workload scaling within buckets.
+
+Buckets are segmented by file size.
+
+This reduces variance without regression.
+
+---
+
+## 7.2 Known Limitation
+
+Real workloads may behave as:
+
+* O(n)
+* O(n log n)
+* O(n²)
+* Constant + linear mixture
+
+Examples:
+
+* Heavily compressed file
+* Raw imaging file
+
+These differences are not explicitly modeled.
+
+---
+
+## 7.3 Mitigation Strategy
+
+Variance penalty absorbs complexity mismatch.
+
+If unacceptable variance observed:
+
+Future upgrade path:
+
+* Segment by file type
+* Segment by compression type
+* Segment by modality
+* Apply regression modeling
+
+Regression not implemented initially due to:
+
+* Complexity
+* Runtime cost
+* Node.js limitations for heavy statistical modeling
+
+---
+
+# 8️⃣ Infrastructure Policy
+
+Affinity does NOT incorporate:
+
+* Disk locality
+* Shared storage contention
+* Network latency
+* Hardware topology
+
+If infrastructure degrades:
+
+* Failures increase
+* μ increases
+* σ increases
+* Affinity decreases
+
+System-wide degradation is tolerated.
+
+Recovery occurs statistically.
+
+Major drawback:
+
+* Slow redemption after infrastructure recovery.
+
+This is accepted for simplicity and conservatism.
+
+---
+
+# 9️⃣ Correlated Failure Handling
+
+If a shared disk fails:
+
+* All LCs accessing it degrade.
+* All affinities drop.
+
+Scheduler sees uniform degradation.
+
+System slows gracefully.
+
+No artificial bias correction is attempted.
+
+This is intentional.
+
+---
+
+# 🔟 Final Affinity Formula
+
+```
+Affinity =
+    Confidence
+    × Reliability
+    × Performance
+```
+
+Properties:
+
+* Continuous
+* Bounded
+* Deterministic
+* Stateless computation (given metrics)
+* No hard thresholds
+* No binary gates
+
+---
+
+# 11️⃣ Non-Goals
+
+Affinity does NOT:
+
+* Decide job priority
+* Perform admission control
+* Enforce health gating
+* Replace node health monitoring
+* Diagnose root causes
+* Guarantee optimal routing
+* Prevent correlated infrastructure failures
+
+It is purely a statistical suitability score.
+
+---
+
+# 12️⃣ Extension Hooks
+
+Future enhancements may include:
+
+* Stage-level affinity
+* Explicit reliability decay
+* Regression-based complexity modeling
+* Admin-triggered reliability reset
+* Hardware-path-aware segmentation
+
+None are enabled by default.
+
+---
+
+# 13️⃣ Design Philosophy Summary
+
+This affinity model is:
+
+* Behavior-driven
+* Conservative
+* Modular
+* Policy-configurable
+* Infrastructure-agnostic
+* Scalable
+
+It prioritizes:
+
+* Stability over aggressiveness
+* Gradual adaptation over rapid oscillation
+* Simplicity over overfitting
+
+---
+
