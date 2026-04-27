@@ -447,3 +447,188 @@ By keeping memory modeling fully isolated:
 - Plugin-type specific defaults (streaming vs in-memory) can be implemented via constructor overrides or a thin wrapper.
 
 
+Here's a **highly technical, in-depth Markdown documentation** for `MemoryProfileStore`, written with a precise, engineering-focused tone and including concrete examples.
+
+```markdown
+# MemoryProfileStore
+
+**Dedicated memory profile learning and safe estimation engine for the DFPS 2.0 Local Coordinator.**
+
+`MemoryProfileStore` is a standalone component responsible for maintaining per-pipeline memory behavior models and producing conservative, high-confidence `requiredMB` estimates for the `MemoryController` and `Planner`. It was intentionally isolated from `LCProfileStore` to allow independent evolution of memory modeling strategies without risking regression in timing, spawn latency, or CPU ratio profiles.
+
+---
+
+## Core Design Principles
+
+1. **Strong Non-Blind Initialization**  
+   Every profile begins with structural priors from the signed resource contract generated during Phase A profiling. This guarantees that even on first encounter of a new pipeline, the system has a realistic and conservative starting point.
+
+2. **Safety-Asymmetric Learning**  
+   Underestimation of memory demand is catastrophic (can trigger OOM kills or node instability). Overestimation is merely suboptimal (reduced utilization). All estimation logic therefore biases toward safety, with margins that decay gracefully as empirical confidence increases.
+
+3. **Hybrid Structural-Empirical Model**  
+   Primary estimator: linear model `requiredMB ≈ baseOverheadMB + variablePerMB × fileSizeMB`.  
+   Safety guard: empirical `maxObservedRatio` derived from profiling and runtime observations.  
+   Final output is the maximum of the linear prediction and a discounted ratio guard, further scaled by a confidence-dependent safety multiplier.
+
+4. **Robustness to Real-World Noise**  
+   The store implements hardened outlier rejection, dynamic learning rates, contract version reset semantics, and automatic state pruning to maintain long-term stability under production workloads.
+
+---
+
+## Key Features (v2)
+
+### 1. Contract Version Tracking & Intelligent Reset
+
+The store tracks `contractVersion` for each profile. When `initFromContract()` is invoked with a newer version than the currently stored one:
+
+- The profile is **reset**: `samples = 0`, `confidence = 0.0`, `recentRatios = []`
+- Core parameters (`baseOverheadMB`, `variablePerMB`, `maxObservedRatio`) are refreshed from the new contract
+- Learning is forced to restart from the updated structural prior
+
+This prevents the store from slowly fighting outdated learned behavior after plugin updates or contract re-profiling.
+
+**Example:**
+```js
+// Initial contract v1.2.3
+memoryStore.initFromContract("dicom-segmenter", "dcm", contractV1);
+
+// Later, after plugin update
+memoryStore.initFromContract("dicom-segmenter", "dcm", contractV1_3); 
+// → Automatic reset + re-learning triggered
+```
+
+### 2. Dynamic & Asymmetric Learning Rates
+
+Learning rates are not static. The store computes effective alphas at update time:
+
+```ts
+const currentBaseAlpha = samples < 8 || confidence < 0.3 
+    ? baseAlphaBase 
+    : baseAlphaBase * (1 - confidence * 0.6);
+```
+
+- High initial learning rate (`baseAlphaBase` / `varAlphaBase`, default 0.25) during cold start or after contract reset.
+- Gradual decay toward more conservative rates as `confidence` approaches 1.0.
+- This allows rapid adaptation to new plugin behavior while stabilizing against noise once sufficient evidence is accumulated.
+
+### 3. Hardened Outlier & Anomaly Rejection
+
+Update logic combines two orthogonal checks:
+
+- **Relative multiplier check**: `newRatio > emaRatio × outlierMultiplier` (default 4.0)
+- **Rolling 3σ statistical check**: Maintains a circular buffer (`recentRatios`, default size 10) of recent ratios and rejects updates where the Z-score exceeds 3.0.
+
+If either condition triggers, the measurement is **rejected** for model updates (does not alter `baseOverheadMB`, `variablePerMB`, or `maxObservedRatio`). However, `samples` and `lastSeen` are still incremented for auditing purposes, and a warning is logged.
+
+**Example behavior:**
+- Normal ratio range: 2.1 – 3.8
+- Sudden spike to 18.4 (corrupt file / infinite loop) → rejected by both checks
+- Gradual drift from plugin improvement → accepted and learned
+
+### 4. Automatic Pruning & Memory Safety
+
+- `pruneStaleProfiles(maxAgeSeconds)` removes profiles whose `lastSeen` exceeds the configured age (default 30 days).
+- Combined with `exportState()` / `importState()`, this ensures the LC’s own memory footprint remains bounded even when encountering thousands of pipeline/extension combinations over long uptime.
+
+---
+
+## All Configurable Parameters
+
+### Learning Rates
+| Parameter       | Default | Purpose |
+|-----------------|---------|-------|
+| `baseAlphaBase` | 0.25    | Initial learning rate for `baseOverheadMB` |
+| `varAlphaBase`  | 0.25    | Initial learning rate for `variablePerMB` |
+| `maxAlpha`      | 0.25    | Learning rate for `maxObservedRatio` (intentionally conservative) |
+
+### Bounds
+| Parameter               | Default | Purpose |
+|-------------------------|---------|-------|
+| `minBaseMB`             | 50      | Lower bound for base overhead |
+| `maxBaseMB`             | 4000    | Upper bound for base overhead |
+| `minVariablePerMB`      | 0.1     | Lower bound for scaling factor |
+| `maxVariablePerMB`      | 15      | Upper bound for scaling factor |
+
+### Update & Detection
+| Parameter                    | Default | Purpose |
+|------------------------------|---------|-------|
+| `sizeWeightTransitionMB`     | 150     | Transition point for base vs variable weighting |
+| `outlierMultiplier`          | 4.0     | Relative outlier rejection threshold |
+| `rollingWindowSize`          | 10      | Size of circular buffer for 3σ calculation |
+| `ratioNoiseThreshold`        | 1.05    | Minimum relative increase to update `maxObservedRatio` |
+
+### Safety Curve (Sigmoid)
+| Parameter            | Default | Purpose |
+|----------------------|---------|-------|
+| `safetyFloor`        | 1.05    | Asymptotic minimum safety multiplier |
+| `safetyBudget`       | 0.25    | Extra safety headroom at confidence = 0 |
+| `safetyInflection`   | 0.45    | Sigmoid inflection point |
+| `safetySteepness`    | 7       | Controls transition sharpness |
+
+### Maintenance
+| Parameter                  | Default     | Purpose |
+|----------------------------|-------------|-------|
+| `maxRatioDiscount`         | 0.92        | Discount applied to ratio guard |
+| `confidenceMaturitySamples`| 15          | Samples required for full confidence |
+| `smallFileThresholdMB`     | 30          | Threshold for extra base protection |
+| `pruneAgeSeconds`          | 2,592,000   | Default 30 days for stale profile eviction |
+
+---
+
+## Public API Highlights
+
+- `initFromContract(pipelineId, extension, contract)` — Version-aware initialization / reset
+- `update(measurement)` — Hardened update with dynamic alphas and outlier rejection
+- `estimateRequiredMB(pipelineId, extension, fileSizeBytes)` — Primary safe estimation method
+- `exportState()` / `importState(state)` — Persistence support for MC synchronization
+- `pruneStaleProfiles(maxAgeSeconds?)` — Garbage collection
+- `get(pipelineId, extension)` — Raw profile inspection
+
+---
+
+## Example Usage
+
+**Cold start + learning progression:**
+
+```js
+const store = new MemoryProfileStore({
+    outlierMultiplier: 3.5,
+    rollingWindowSize: 12,
+    safetySteepness: 8
+});
+
+// Phase A contract initialization
+store.initFromContract("dicom-segmenter", "dcm", signedContractV1);
+
+// Runtime updates from worker
+store.update({
+    pipelineId: "dicom-segmenter",
+    extension: "dcm",
+    peakRamBytes: 1_850_000_000,
+    fileSizeBytes: 920_000_000
+});
+
+// After plugin update
+store.initFromContract("dicom-segmenter", "dcm", signedContractV1_3);
+// → Automatic reset and re-learning triggered
+```
+
+**Estimation output examples** (after varying sample counts):
+
+- **Cold start (0 samples)**: High safety margin (~1.30×)
+- **Early learning (5 samples)**: Moderate margin (~1.18×)
+- **Mature profile (20+ samples)**: Near-minimal safety (~1.06×)
+
+---
+
+## Future Extension Points
+
+Thanks to component isolation, the following can be added with minimal risk:
+
+- Per-size-bucket profiles (SMALL / MEDIUM / LARGE)
+- Full variance tracking and confidence intervals
+- Measurement-stability-based adaptive alphas
+- Plugin-type specific default overrides (streaming vs in-memory)
+- Kalman filtering or online linear regression
+
